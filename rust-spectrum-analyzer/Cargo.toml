@@ -1,0 +1,9 @@
+[package]
+name = "spectrum-analyzer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hound = "3.5.1"
+rustfft = "6.4.1"
+image = "0.25"
