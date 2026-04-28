@@ -100,6 +100,16 @@ fn chunk_samples(mono: &[f32], size: usize, overlap_ratio: f64) -> Vec<Vec<f32>>
     let hop = (size as f64 * (1.0 - overlap_ratio)) as usize;
     let mut chunks = Vec::new();
 
+    /*
+     * This saves the overlapping chunks
+     * into their own vector in the chunks vector.
+     * [0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15]
+     *  └──────────┘                        ← window 1 (start=0)
+     *           └──────────┘               ← window 2 (start=4)
+     *                     └──────────┘     ← window 3 (start=8)                              
+     *                          └──────────┘  ← window 4 (start=12)
+     * etc...
+     */
     let mut start = 0;
     while start + size <= mono.len() {
         // Clone the slice into its own Vec so windowing is safe.
