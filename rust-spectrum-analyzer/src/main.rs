@@ -2,7 +2,6 @@ use hound::WavReader;
 use image::{ImageBuffer, Rgb};
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::env;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
@@ -146,20 +145,6 @@ fn apply_hamming_window(chunks: &mut [Vec<f32>]) {
 // STEP 5 & 6: PARALLEL FFT + MAGNITUDE COMPUTATION
 // ============================================================
 
-/// A unit of work sent to worker threads.
-/// Carries the chunk data plus its original index so we can
-/// reassemble results in the correct time order.
-struct FftJob {
-    index: usize,
-    chunk: Vec<f32>,
-}
-
-/// What each worker sends back.
-struct FftResult {
-    index: usize,
-    magnitudes: Vec<f32>,
-}
-
 /// Distributes FFT computation across NUM_WORKERS OS threads.
 ///
 /// Architecture (same fan-out/fan-in pattern as the Go version):
@@ -184,113 +169,49 @@ struct FftResult {
 fn parallel_fft(chunks: Vec<Vec<f32>>, num_workers: usize) -> Vec<Vec<f32>> {
     let num_chunks = chunks.len();
 
-    // --- Create channels ---
-    // job_tx/job_rx: main thread sends jobs, workers receive them.
-    // result_tx/result_rx: workers send results, main thread receives them.
-    let (job_tx, job_rx) = mpsc::channel::<FftJob>();
-    let (result_tx, result_rx) = mpsc::channel::<FftResult>();
+    // Partition: split chunks into num_workers roughly equal groups,
+    // pairing each chunk with its original index for reordering later.
+    let indexed: Vec<(usize, Vec<f32>)> = chunks.into_iter().enumerate().collect();
+    let mut partitions: Vec<Vec<(usize, Vec<f32>)>> = (0..num_workers).map(|_| Vec::new()).collect();
+    for (i, item) in indexed.into_iter().enumerate() {
+        partitions[i % num_workers].push(item);
+    }
 
-    // --- Problem: mpsc::Receiver is NOT Clone ---
-    // Unlike Go channels where multiple goroutines can read from one channel,
-    // Rust's mpsc::Receiver can only have ONE consumer. To share it across
-    // multiple worker threads, we wrap it in Arc<Mutex<>>.
-    //   Arc    = Atomic Reference Counting — lets multiple threads own the value
-    //   Mutex  = Mutual Exclusion — only one thread can lock and read at a time
-    let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+    // Spawn one thread per partition. Each thread owns its data — no shared state.
+    let handles: Vec<_> = partitions
+        .into_iter()
+        .map(|partition| {
+            thread::spawn(move || {
+                let mut planner = FftPlanner::<f32>::new();
+                let fft = planner.plan_fft_forward(CHUNK_SIZE);
 
-    // --- Spawn worker threads ---
-    let mut handles = Vec::new();
-
-    for _worker_id in 0..num_workers {
-        // Clone the Arc (increments reference count, doesn't copy the data)
-        // and clone the result sender (mpsc allows multiple producers).
-        let job_rx = std::sync::Arc::clone(&job_rx);
-        let result_tx = result_tx.clone();
-
-        let handle = thread::spawn(move || {
-            // Each worker creates its own FFT planner and plan.
-            // This avoids sharing mutable FFT state between threads.
-            let mut planner = FftPlanner::<f32>::new();
-            let fft = planner.plan_fft_forward(CHUNK_SIZE);
-
-            loop {
-                // Lock the mutex, then try to receive a job.
-                // lock() blocks until no other thread holds the lock.
-                // recv() blocks until a job is available or the channel closes.
-                let job = {
-                    let rx = job_rx.lock().unwrap();
-                    rx.recv() // Returns Err when channel is closed (all senders dropped)
-                };
-                // Mutex is unlocked here when `rx` goes out of scope,
-                // allowing other workers to receive jobs immediately.
-
-                match job {
-                    Ok(job) => {
-                        // Convert real samples to complex (imaginary part = 0).
-                        // rustfft operates on Complex numbers.
-                        let mut buffer: Vec<Complex<f32>> = job
-                            .chunk
+                partition
+                    .into_iter()
+                    .map(|(index, chunk)| {
+                        let mut buffer: Vec<Complex<f32>> = chunk
                             .iter()
                             .map(|&s| Complex::new(s, 0.0))
                             .collect();
-
-                        // Run the FFT in-place — buffer now contains
-                        // complex frequency-domain coefficients.
                         fft.process(&mut buffer);
-
-                        // Compute magnitudes for the first half only.
-                        // For real-valued input, the FFT output is symmetric:
-                        //   buffer[k] == conjugate(buffer[N-k])
-                        // So we only need bins 0..N/2+1.
                         let num_bins = CHUNK_SIZE / 2 + 1;
                         let magnitudes: Vec<f32> = buffer[..num_bins]
                             .iter()
-                            .map(|c| c.norm()) // norm() = sqrt(re² + im²)
+                            .map(|c| c.norm())
                             .collect();
+                        (index, magnitudes)
+                    })
+                    .collect::<Vec<(usize, Vec<f32>)>>()
+            })
+        })
+        .collect();
 
-                        // Send result back with original index for reordering.
-                        result_tx.send(FftResult {
-                            index: job.index,
-                            magnitudes,
-                        }).unwrap();
-                    }
-                    Err(_) => {
-                        // Channel closed — no more jobs coming. Exit the loop.
-                        break;
-                    }
-                }
-            }
-            // result_tx is dropped here when the thread exits.
-            // Once ALL workers exit, all clones of result_tx are dropped,
-            // which causes result_rx.recv() to return Err, ending collection.
-        });
-
-        handles.push(handle);
-    }
-
-    // --- Send all chunks as jobs ---
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        job_tx.send(FftJob { index: i, chunk }).unwrap();
-    }
-    // Drop the sender to close the channel.
-    // Workers will finish remaining jobs, then see Err from recv() and exit.
-    drop(job_tx);
-
-    // --- Collect results ---
-    // Pre-allocate the spectrogram array so we can insert at arbitrary indices.
+    // Collect and reorder by original index.
     let mut spectrogram: Vec<Vec<f32>> = vec![Vec::new(); num_chunks];
-
-    // Receive results until the channel closes (all workers done).
-    for result in result_rx {
-        spectrogram[result.index] = result.magnitudes;
-    }
-
-    // --- Wait for all threads to finish ---
-    // join() ensures we don't return until every thread has exited cleanly.
     for handle in handles {
-        handle.join().unwrap();
+        for (index, magnitudes) in handle.join().unwrap() {
+            spectrogram[index] = magnitudes;
+        }
     }
-
     spectrogram
 }
 
