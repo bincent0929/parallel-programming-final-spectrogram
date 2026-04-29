@@ -131,6 +131,7 @@ fn chunk_samples(mono: &[f32], size: usize, overlap_ratio: f64) -> Vec<Vec<f32>>
 /// This tapers the edges of each chunk toward zero, reducing
 /// spectral leakage — the smearing of energy across frequency
 /// bins caused by sharp discontinuities at chunk boundaries.
+/// I can parallelize this.
 fn apply_hamming_window(chunks: &mut [Vec<f32>]) {
     for chunk in chunks.iter_mut() {
         let n = chunk.len() as f32;
@@ -146,26 +147,6 @@ fn apply_hamming_window(chunks: &mut [Vec<f32>]) {
 // ============================================================
 
 /// Distributes FFT computation across NUM_WORKERS OS threads.
-///
-/// Architecture (same fan-out/fan-in pattern as the Go version):
-///
-///   Main thread
-///       |
-///       | sends FftJobs into `job_tx`
-///       v
-///   [job channel] ──> Worker 0 ──┐
-///                 ──> Worker 1 ──┤ each sends FftResult
-///                 ──> Worker 2 ──┤ into `result_tx`
-///                 ──> ...    ──┤
-///                 ──> Worker 7 ──┘
-///                                |
-///                                v
-///                          [result channel]
-///                                |
-///                                v
-///                          Main thread collects
-///                          and reorders by index
-///
 fn parallel_fft(chunks: Vec<Vec<f32>>, num_workers: usize) -> Vec<Vec<f32>> {
     let num_chunks = chunks.len();
 
@@ -173,8 +154,8 @@ fn parallel_fft(chunks: Vec<Vec<f32>>, num_workers: usize) -> Vec<Vec<f32>> {
     // pairing each chunk with its original index for reordering later.
     let indexed: Vec<(usize, Vec<f32>)> = chunks.into_iter().enumerate().collect();
     let mut partitions: Vec<Vec<(usize, Vec<f32>)>> = (0..num_workers).map(|_| Vec::new()).collect();
-    for (i, item) in indexed.into_iter().enumerate() {
-        partitions[i % num_workers].push(item);
+    for (index, chunk) in indexed.into_iter().enumerate() {
+        partitions[index % num_workers].push(chunk);
     }
 
     // Spawn one thread per partition. Each thread owns its data — no shared state.
@@ -193,7 +174,20 @@ fn parallel_fft(chunks: Vec<Vec<f32>>, num_workers: usize) -> Vec<Vec<f32>> {
                             .map(|&s| Complex::new(s, 0.0))
                             .collect();
                         fft.process(&mut buffer);
+                        /* takes the first half
+                        of the chunk because
+                        FFT output is symmetric
+                        this has it take the
+                        positive segment to get the
+                        magnitude */
                         let num_bins = CHUNK_SIZE / 2 + 1;
+                        /*
+                         * The mapping takes the
+                         * complex value that the
+                         * FFT had taken it and returns
+                         * the computed value as a
+                         * magnitude.
+                         */
                         let magnitudes: Vec<f32> = buffer[..num_bins]
                             .iter()
                             .map(|c| c.norm())
@@ -201,6 +195,8 @@ fn parallel_fft(chunks: Vec<Vec<f32>>, num_workers: usize) -> Vec<Vec<f32>> {
                         (index, magnitudes)
                     })
                     .collect::<Vec<(usize, Vec<f32>)>>()
+                    // This is called "turbofish" syntax
+                    // it tells the compiler the "concrete type"
             })
         })
         .collect();
