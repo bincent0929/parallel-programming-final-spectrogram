@@ -303,22 +303,27 @@ fn render_spectrogram(
 ///   0.75 → yellow
 ///   1.00 → white
 fn heat_color(t: f32) -> Rgb<u8> {
-    let (r, g, b) = if t < 0.25 {
-        // Black → Blue
-        let s = t / 0.25;
-        (0.0, 0.0, s)
-    } else if t < 0.5 {
-        // Blue → Red
-        let s = (t - 0.25) / 0.25;
-        (s, 0.0, 1.0 - s)
-    } else if t < 0.75 {
-        // Red → Yellow
-        let s = (t - 0.5) / 0.25;
-        (1.0, s, 0.0)
-    } else {
-        // Yellow → White
-        let s = (t - 0.75) / 0.25;
-        (1.0, 1.0, s)
+    let (r, g, b) = match t {
+        t if t < 0.25 => {
+            // Black → Blue
+            let s = t / 0.25;
+            (0.0, 0.0, s)
+        },
+        t if t < 0.5 => {
+            // Blue → Red
+            let s = (t - 0.25) / 0.25;
+            (s, 0.0, 1.0 - s)
+        },
+        t if t < 0.75 => {
+            // Red → Yellow
+            let s = (t - 0.5) / 0.25;
+            (1.0, s, 0.0)
+        },
+        _ => {
+            // Yellow → White
+            let s = (t - 0.75) / 0.25;
+            (1.0, 1.0, s)
+        }
     };
 
     Rgb([
